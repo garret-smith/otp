@@ -1422,158 +1422,106 @@ read_topology(erts_cpu_info_t *cpuinfo)
 
 #elif defined(__FreeBSD__)
 
-/**
- * FreeBSD topology detection is based on kern.sched.topology_spec XML as
- * exposed by the ULE scheduler and described in SMP(4). It is available in
- * 8.0 and higher.
- *
- * Threads are identified in this XML chunk with a THREAD flag. The function
- * (simplistically) distinguishes cores and processors by the amount of cache
- * they share (0 => processor, otherwise => core). Nodes are not identified
- * (ULE doesn't handle NUMA yet, I believe).
- */
+// ----
+// FreeBSD CPU topology detection
+//
+// Parse the XML returned from 'sysctl kern.sched.topology_spec'
+// and documented (somewhat) in 'man 4 smp'
+//
+// No support for nodes or processor_nodes
+// ----
 
-/**
- * Recursively parse a topology_spec <group> tag.
- */
-static
-const char* parse_topology_spec_group(erts_cpu_info_t *cpuinfo, const char* xml, int parentCacheLevel, int* processor_p, int* core_p, int* index_procs_p) {
-    int error = 0;
-    int cacheLevel = parentCacheLevel;
-    const char* next_group_start = strstr(xml + 1, "<group");
-    int is_thread_group = 0;
-    const char* next_cache_level;
-    const char* next_thread_flag;
-    const char* next_group_end;
-    const char* next_children;
-    const char* next_children_end;
+// grab the logical IDs (x, y, ...) from "<cpu >x, y, ...</cpu>"
+// the same CDATA can either be cores or threads in a core
+// If core == -1, the CDATA contains cores
+// if core >= 0, CDATA contains threads and core is the core index
+const char*
+parse_cpu_cdata(erts_cpu_info_t *cpuinfo, int processor, int core, const char* xml) {
+    const char* cpu_cdata_start = strstr(xml, ">") + 1;
+    const char* cpu_cdata_end = strstr(cpu_cdata_start, "<");
+    int cdata_len = cpu_cdata_end - cpu_cdata_start;
 
-    /* parse the cache level */
-    next_cache_level = strstr(xml, "cache-level=\"");
-    if (next_cache_level && (next_group_start == NULL || next_cache_level < next_group_start)) {
-	sscanf(next_cache_level, "cache-level=\"%i\"", &cacheLevel);
-    }
+    char* cpu_cdata = malloc(cdata_len+1);
+    if (!cpu_cdata)
+	return NULL;
+    strncpy(cpu_cdata, cpu_cdata_start, cdata_len);
+    cpu_cdata[cdata_len] = '\0';
 
-    /* parse the threads flag */
-    next_thread_flag = strstr(xml, "THREAD");
-    if (next_thread_flag && (next_group_start == NULL || next_thread_flag < next_group_start))
-	is_thread_group = 1;
+    char* next = cpu_cdata;
+    char* cpu_logical_id;
 
-    /* Determine if it's a leaf with the position of the next children tag */
-    next_group_end = strstr(xml, "</group>");
-    next_children = strstr(xml, "<children>");
-    next_children_end = strstr(xml, "</children>");
-    if (next_children == NULL || next_group_end < next_children) {
-	do {
-	    const char* next_cpu_start;
-	    const char* next_cpu_cdata;
-	    const char* next_cpu_end;
-	    int cpu_str_size;
-	    char* cpu_str;
-	    char* cpu_crsr;
-	    char* brkb;
-	    int thread = 0;
-	    int index_procs = *index_procs_p;
-
-	    next_cpu_start = strstr(xml, "<cpu");
-	    if (!next_cpu_start) {
-		error = 1;
-		break;
-	    }
-	    next_cpu_cdata = strstr(next_cpu_start, ">") + 1;
-	    if (!next_cpu_cdata) {
-		error = 1;
-		break;
-	    }
-	    next_cpu_end = strstr(next_cpu_cdata, "</cpu>");
-	    if (!next_cpu_end) {
-		error = 1;
-		break;
-	    }
-	    cpu_str_size = next_cpu_end - next_cpu_cdata;
-	    cpu_str = (char*) malloc(cpu_str_size + 1);
-	    memcpy(cpu_str, (const char*) next_cpu_cdata, cpu_str_size);
-	    cpu_str[cpu_str_size] = 0;
-	    for (cpu_crsr = strtok_r(cpu_str, " \t,", &brkb); cpu_crsr; cpu_crsr = strtok_r(NULL, " \t,", &brkb)) {
-		int cpu_id;
-		if (index_procs >= cpuinfo->configured) {
-		    void* t = realloc(cpuinfo->topology, (sizeof(erts_cpu_topology_t) * (index_procs + 1)));
-		    if (t) {
-			cpuinfo->topology = t;
-		    } else {
-			error = 1;
-			break;
-		    }
-		}
-		cpu_id = atoi(cpu_crsr);
-		cpuinfo->topology[index_procs].node = -1;
-		cpuinfo->topology[index_procs].processor = *processor_p;
-		cpuinfo->topology[index_procs].processor_node = -1;
-		cpuinfo->topology[index_procs].core = *core_p;
-		cpuinfo->topology[index_procs].thread = thread;
-		cpuinfo->topology[index_procs].logical = cpu_id;
-		if (is_thread_group) {
-		    thread++;
-		} else {
-		    *core_p = (*core_p)++;
-		}
-		index_procs++;
-	    }
-	    *index_procs_p = index_procs;
-	    free(cpu_str);
-	} while (0);
-	xml = next_group_end;
-    } else {
-	while (next_group_start != NULL && next_group_start < next_children_end) {
-	    xml = parse_topology_spec_group(cpuinfo, next_group_start, cacheLevel, processor_p, core_p, index_procs_p);
-	    if (!xml)
-		break;
-	    next_group_start = strstr(xml, "<group");
-	    next_children_end = strstr(xml, "</children>");
+    int thread = 0;
+    while ((cpu_logical_id = strsep(&next, " ,\t")) != NULL) {
+	if (*cpu_logical_id == '\0')
+	    continue;
+	int logical = atoi(cpu_logical_id);
+	cpuinfo->topology[logical].processor = processor;
+	cpuinfo->topology[logical].logical = logical;
+	if (core == -1) {
+	    cpuinfo->topology[logical].core = thread;
+	    cpuinfo->topology[logical].thread = 0;
+	} else {
+	    cpuinfo->topology[logical].core = core;
+	    cpuinfo->topology[logical].thread = thread;
 	}
+	thread += 1;
     }
-
-    if (parentCacheLevel == 0) {
-	*core_p = 0;
-	*processor_p = (*processor_p)++;
-    } else {
-	*core_p = (*core_p)++;
-    }
-
-    if (error)
-	xml = NULL;
-
-    return xml;
+    free(cpu_cdata);
+    return cpu_cdata_end + strlen("</cpu>");
 }
 
-/**
- * Parse the topology_spec. Return the number of CPUs or 0 if parsing failed.
- */
-static
-int parse_topology_spec(erts_cpu_info_t *cpuinfo, const char* xml) {
-    int res = 1;
-    int index_procs = 0;
+const char*
+parse_threadgroup(erts_cpu_info_t *cpuinfo, int processor, const char* xml) {
+    const char* endtag = "</children>";
+    const char* next_cpu = strstr(xml, "<cpu ");
+    const char* children_end = strstr(xml, endtag);
+    const char* cpu_end = NULL;
+
     int core = 0;
-    int processor = 0;
-    xml = strstr(xml, "<groups");
-    if (!xml)
-	return -1;
-
-    xml += 7;
-    xml = strstr(xml, "<group");
-    while (xml) {
-	xml = parse_topology_spec_group(cpuinfo, xml, 0, &processor, &core, &index_procs);
-	if (!xml) {
-	    res = 0;
-	    break;
-	}
-	xml = strstr(xml, "<group");
+    while (next_cpu != NULL && next_cpu < children_end) {
+	cpu_end = parse_cpu_cdata(cpuinfo, processor, core, next_cpu);
+	if (!cpu_end)
+	    return NULL;
+	next_cpu = strstr(cpu_end, "<cpu ");
+	core += 1;
     }
+    return strstr(cpu_end, endtag) + strlen(endtag);
+}
 
-    if (res)
-	res = index_procs;
+// A CPU group either lists the CPUs directly (no threads)
+// or a child group with the threads (as CPUs)
+const char*
+parse_cpu(erts_cpu_info_t *cpuinfo, int processor, const char* xml) {
+    const char* endtag = "</group>";
+    const char* parse_end;
 
-    return res;
+    const char* children = strstr(xml, "<children>");
+    if (!children)
+	parse_end = parse_cpu_cdata(cpuinfo, processor, -1, strstr(xml, "<cpu"));
+    else
+	parse_end = parse_threadgroup(cpuinfo, processor, children);
+
+    if (!parse_end)
+	return NULL;
+
+    return strstr(parse_end, endtag) + strlen(endtag);
+}
+
+// First interesting group is the <group> after the first <children> tag
+// Each one of these is a processor
+const char*
+parse_processors(erts_cpu_info_t *cpuinfo, const char* xml) {
+    int processor = 0;
+    const char* group = strstr(xml, "<children>");
+    char* nextgroup = NULL;
+
+    while ((nextgroup = strstr(group, "<group ")) != NULL) {
+	group = parse_cpu(cpuinfo, processor, nextgroup);
+	processor += 1;
+	if(group == NULL)
+	    return NULL;
+    }
+    return group;
 }
 
 static int
@@ -1583,28 +1531,14 @@ read_topology(erts_cpu_info_t *cpuinfo)
     int res = 0;
     size_t topology_spec_size = 0;
     void* topology_spec = NULL;
+    int cpus_online;
+    size_t cpus_online_size = sizeof(cpus_online);
 
     errno = 0;
 
     if (cpuinfo->configured < 1)
 	goto error;
 
-    cpuinfo->topology_size = cpuinfo->configured;
-    cpuinfo->topology = malloc(sizeof(erts_cpu_topology_t)
-			       * cpuinfo->configured);
-    if (!cpuinfo->topology) {
-	res = -ENOMEM;
-	goto error;
-    }
-
-    for (ix = 0; ix < cpuinfo->configured; ix++) {
-	cpuinfo->topology[ix].node = -1;
-	cpuinfo->topology[ix].processor = -1;
-	cpuinfo->topology[ix].processor_node = -1;
-	cpuinfo->topology[ix].core = -1;
-	cpuinfo->topology[ix].thread = -1;
-	cpuinfo->topology[ix].logical = -1;
-    }
 
     if (!sysctlbyname("kern.sched.topology_spec", NULL, &topology_spec_size, NULL, 0)) {
 	topology_spec = malloc(topology_spec_size);
@@ -1613,24 +1547,35 @@ read_topology(erts_cpu_info_t *cpuinfo)
 	    goto error;
 	}
 
+	if(sysctlbyname("kern.smp.cpus", &cpus_online, &cpus_online_size, NULL, 0)) {
+	    goto error;
+	}
+
 	if (sysctlbyname("kern.sched.topology_spec", topology_spec, &topology_spec_size, NULL, 0)) {
 	    goto error;
 	}
 
-	res = parse_topology_spec(cpuinfo, topology_spec);
-	if (!res || res < cpuinfo->online)
+	cpuinfo->topology = malloc(sizeof(erts_cpu_topology_t)
+				* cpus_online);
+	if (!cpuinfo->topology) {
+	    res = -ENOMEM;
+	    goto error;
+	}
+
+	cpuinfo->topology_size = cpus_online;
+	for (ix = 0; ix < cpus_online; ix++) {
+	    cpuinfo->topology[ix].node = -1;
+	    cpuinfo->topology[ix].processor = -1;
+	    cpuinfo->topology[ix].processor_node = -1;
+	    cpuinfo->topology[ix].core = -1;
+	    cpuinfo->topology[ix].thread = -1;
+	    cpuinfo->topology[ix].logical = -1;
+	}
+
+	if (parse_processors(cpuinfo, topology_spec) == NULL) {
 	    res = 0;
-	else {
-	    cpuinfo->topology_size = res;
-
-	    if (cpuinfo->topology_size != cpuinfo->configured) {
-		void *t = realloc(cpuinfo->topology, (sizeof(erts_cpu_topology_t)
-						  * cpuinfo->topology_size));
-		if (t)
-		    cpuinfo->topology = t;
-	    }
-
-	    adjust_processor_nodes(cpuinfo, 1);
+	} else {
+	    res = cpus_online;
 
 	    qsort(cpuinfo->topology,
 	        cpuinfo->topology_size,
